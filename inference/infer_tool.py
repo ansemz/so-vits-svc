@@ -151,6 +151,7 @@ class Svc(object):
                     self.target_sample = self.diffusion_args.data.sampling_rate
                     self.hop_size = self.diffusion_args.data.block_size
                     self.spk2id = self.diffusion_args.spk
+                    self.dtype = torch.float32
                     self.speech_encoder = self.diffusion_args.data.encoder
                     self.unit_interpolate_mode = self.diffusion_args.data.unit_interpolate_mode if self.diffusion_args.data.unit_interpolate_mode is not None else 'left'
                 if spk_mix_enable:
@@ -192,6 +193,7 @@ class Svc(object):
             self.hps_ms.train.segment_size // self.hps_ms.data.hop_length,
             **self.hps_ms.model)
         _ = utils.load_checkpoint(self.net_g_path, self.net_g_ms, None)
+        self.dtype = list(self.net_g_ms.parameters())[0].dtype
         if "half" in self.net_g_path and torch.cuda.is_available():
             _ = self.net_g_ms.half().eval().to(self.dev)
         else:
@@ -201,9 +203,10 @@ class Svc(object):
 
     def get_unit_f0(self, wav, tran, cluster_infer_ratio, speaker, f0_filter ,f0_predictor,cr_threshold=0.05):
 
-        f0_predictor_object = utils.get_f0_predictor(f0_predictor,hop_length=self.hop_size,sampling_rate=self.target_sample,device=self.dev,threshold=cr_threshold)
-        
-        f0, uv = f0_predictor_object.compute_f0_uv(wav)
+        if not hasattr(self,"f0_predictor_object") or self.f0_predictor_object is None or f0_predictor != self.f0_predictor_object.name:
+            self.f0_predictor_object = utils.get_f0_predictor(f0_predictor,hop_length=self.hop_size,sampling_rate=self.target_sample,device=self.dev,threshold=cr_threshold)
+        f0, uv = self.f0_predictor_object.compute_f0_uv(wav)
+
         if f0_filter and sum(f0) == 0:
             raise F0FilterException("No voice detected")
         f0 = torch.FloatTensor(f0).to(self.dev)
@@ -213,21 +216,24 @@ class Svc(object):
         f0 = f0.unsqueeze(0)
         uv = uv.unsqueeze(0)
 
-        wav16k = librosa.resample(wav, orig_sr=self.target_sample, target_sr=16000)
-        wav16k = torch.from_numpy(wav16k).to(self.dev)
+        wav = torch.from_numpy(wav).to(self.dev)
+        if not hasattr(self,"audio16k_resample_transform"):
+            self.audio16k_resample_transform = torchaudio.transforms.Resample(self.target_sample, 16000).to(self.dev)
+        wav16k = self.audio16k_resample_transform(wav[None,:])[0]
+        
         c = self.hubert_model.encoder(wav16k)
         c = utils.repeat_expand_2d(c.squeeze(0), f0.shape[1],self.unit_interpolate_mode)
 
         if cluster_infer_ratio !=0:
             if self.feature_retrieval:
                 speaker_id = self.spk2id.get(speaker)
-                if speaker_id is None:
-                    raise RuntimeError("The name you entered is not in the speaker list!")
                 if not speaker_id and type(speaker) is int:
                     if len(self.spk2id.__dict__) >= speaker:
                         speaker_id = speaker
+                if speaker_id is None:
+                    raise RuntimeError("The name you entered is not in the speaker list!")
                 feature_index = self.cluster_model[speaker_id]
-                feat_np = c.transpose(0,1).cpu().numpy()
+                feat_np = np.ascontiguousarray(c.transpose(0,1).cpu().numpy())
                 if self.big_npy is None or self.now_spk_id != speaker_id:
                    self.big_npy = feature_index.reconstruct_n(0, feature_index.ntotal)
                    self.now_spk_id = speaker_id
@@ -246,7 +252,7 @@ class Svc(object):
 
         c = c.unsqueeze(0)
         return c, f0, uv
-
+    
     def infer(self, speaker, tran, raw_path,
               cluster_infer_ratio=0,
               auto_predict_f0=False,
@@ -261,7 +267,11 @@ class Svc(object):
               second_encoding = False,
               loudness_envelope_adjustment = 1
               ):
-        wav, sr = librosa.load(raw_path, sr=self.target_sample)
+        torchaudio.set_audio_backend("soundfile")
+        wav, sr = torchaudio.load(raw_path)
+        if not hasattr(self,"audio_resample_transform") or self.audio16k_resample_transform.orig_freq != sr:
+            self.audio_resample_transform = torchaudio.transforms.Resample(sr,self.target_sample)
+        wav = self.audio_resample_transform(wav).numpy()[0]
         if spk_mix:
             c, f0, uv = self.get_unit_f0(wav, tran, 0, None, f0_filter,f0_predictor,cr_threshold=cr_threshold)
             n_frames = f0.size(1)
@@ -276,8 +286,9 @@ class Svc(object):
             sid = torch.LongTensor([int(speaker_id)]).to(self.dev).unsqueeze(0)
             c, f0, uv = self.get_unit_f0(wav, tran, cluster_infer_ratio, speaker, f0_filter,f0_predictor,cr_threshold=cr_threshold)
             n_frames = f0.size(1)
-        if "half" in self.net_g_path and torch.cuda.is_available():
-            c = c.half()
+        c = c.to(self.dtype)
+        f0 = f0.to(self.dtype)
+        uv = uv.to(self.dtype)
         with torch.no_grad():
             start = time.time()
             vol = None
@@ -289,11 +300,16 @@ class Svc(object):
             else:
                 audio = torch.FloatTensor(wav).to(self.dev)
                 audio_mel = None
+            if self.dtype != torch.float32:
+                c = c.to(torch.float32)
+                f0 = f0.to(torch.float32)
+                uv = uv.to(torch.float32)
             if self.only_diffusion or self.shallow_diffusion:
                 vol = self.volume_extractor.extract(audio[None,:])[None,:,None].to(self.dev) if vol is None else vol[:,:,None]
                 if self.shallow_diffusion and second_encoding:
-                    audio16k = librosa.resample(audio.detach().cpu().numpy(), orig_sr=self.target_sample, target_sr=16000)
-                    audio16k = torch.from_numpy(audio16k).to(self.dev)
+                    if not hasattr(self,"audio16k_resample_transform"):
+                        self.audio16k_resample_transform = torchaudio.transforms.Resample(self.target_sample, 16000).to(self.dev)
+                    audio16k = self.audio16k_resample_transform(audio[None,:])[0]
                     c = self.hubert_model.encoder(audio16k)
                     c = utils.repeat_expand_2d(c.squeeze(0), f0.shape[1],self.unit_interpolate_mode)
                 f0 = f0[:,:,None]

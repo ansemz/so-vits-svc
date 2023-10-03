@@ -1,12 +1,22 @@
+<div align="center">
+<img alt="LOGO" src="https://avatars.githubusercontent.com/u/127122328?s=400&u=5395a98a4f945a3a50cb0cc96c2747505d190dbc&v=4" width="300" height="300" />
+  
 # SoftVC VITS Singing Voice Conversion
 
 [**English**](./README.md) | [**中文简体**](./README_zh_CN.md)
 
-#### ✨ A studio that contains visible f0 editor, speaker mix timeline editor and other features (Where the Onnx models are used) : [MoeVoiceStudio](https://github.com/NaruseMioShirakana/MoeVoiceStudio)
+[![Open In Colab](https://img.shields.io/badge/Colab-F9AB00?style=for-the-badge&logo=googlecolab&color=525252)](https://colab.research.google.com/github/svc-develop-team/so-vits-svc/blob/4.1-Stable/sovits4_for_colab.ipynb)
+[![Licence](https://img.shields.io/badge/LICENSE-AGPL3.0-green.svg?style=for-the-badge)](https://github.com/svc-develop-team/so-vits-svc/blob/4.1-Stable/LICENSE)
 
-#### ✨ A fork with a greatly improved user interface: [34j/so-vits-svc-fork](https://github.com/34j/so-vits-svc-fork)
+This round of limited time update is coming to an end, the warehouse will enter the Archieve state, please know
 
-#### ✨ A client supports real-time conversion: [w-okada/voice-changer](https://github.com/w-okada/voice-changer)
+</div>
+
+> ✨ A studio that contains visible f0 editor, speaker mix timeline editor and other features (Where the Onnx models are used) : [MoeVoiceStudio](https://github.com/NaruseMioShirakana/MoeVoiceStudio)
+
+> ✨ A fork with a greatly improved user interface: [34j/so-vits-svc-fork](https://github.com/34j/so-vits-svc-fork)
+
+> ✨ A client supports real-time conversion: [w-okada/voice-changer](https://github.com/w-okada/voice-changer)
 
 **This project differs fundamentally from VITS, as it focuses on Singing Voice Conversion (SVC) rather than Text-to-Speech (TTS). In this project, TTS functionality is not supported, and VITS is incapable of performing SVC tasks. It's important to note that the models used in these two projects are not interchangeable or universally applicable.**
 
@@ -85,7 +95,7 @@ Or download the following ContentVec, which is only 199MB in size but has the sa
 
 ```shell
 # contentvec
-wget -P pretrain/ http://obs.cstcloud.cn/share/obs/sankagenkeshi/checkpoint_best_legacy_500.pt
+wget -P pretrain/ https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt -O checkpoint_best_legacy_500.pt
 # Alternatively, you can manually download and place it in the hubert directory
 ```
 
@@ -145,6 +155,8 @@ While the pretrained model typically does not pose copyright concerns, it is ess
 
 #### **Optional(Select as Required)**
 
+##### NSF-HIFIGAN
+
 If you are using the `NSF-HIFIGAN enhancer` or `shallow diffusion`, you will need to download the pre-trained NSF-HIFIGAN model.
 
 - Pre-trained NSF-HIFIGAN Vocoder: [nsf_hifigan_20221211.zip](https://github.com/openvpi/vocoders/releases/download/nsf-hifigan-v1/nsf_hifigan_20221211.zip)
@@ -157,6 +169,25 @@ unzip -od pretrain/nsf_hifigan pretrain/nsf_hifigan_20221211.zip
 # Alternatively, you can manually download and place it in the pretrain/nsf_hifigan directory
 # URL: https://github.com/openvpi/vocoders/releases/tag/nsf-hifigan-v1
 ```
+
+##### RMVPE
+
+If you are using the `rmvpe` F0 Predictor, you will need to download the pre-trained RMVPE model.
+
++ download model at [rmvpe.zip](https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip), this weight is recommended.
+  + unzip `rmvpe.zip`，and rename the `model.pt` file to `rmvpe.pt` and place it under the `pretrain` directory.
+
+- ~~download model at [rmvpe.pt](https://huggingface.co/datasets/ylzz1997/rmvpe_pretrain_model/resolve/main/rmvpe.pt)~~
+  - ~~Place it under the `pretrain` directory~~
+
+##### FCPE(Preview version)
+
+[FCPE(Fast Context-base Pitch Estimator)](https://github.com/CNChTu/MelPE) is a dedicated F0 predictor designed for real-time voice conversion and will become the preferred F0 predictor for sovits real-time voice conversion in the future.(The paper is being written)
+
+If you are using the `fcpe` F0 Predictor, you will need to download the pre-trained FCPE model.
+
+- download model at [fcpe.pt](https://huggingface.co/datasets/ylzz1997/rmvpe_pretrain_model/resolve/main/fcpe.pt)
+  - Place it under the `pretrain` directory
 
 ## 📊 Dataset Preparation
 
@@ -173,6 +204,7 @@ dataset_raw
     ├───...
     └───xxx7-xxx007.wav
 ```
+There are no specific restrictions on the format of the name for each audio file (naming conventions such as `000001.wav` to `999999.wav` are also valid), but the file type must be `WAV``.
 
 You can customize the speaker's name as showed below:
 
@@ -278,24 +310,35 @@ nsf-snake-hifigan
 python preprocess_hubert_f0.py --f0_predictor dio
 ```
 
-f0_predictor has four options
+f0_predictor has the following options
 
 ```
 crepe
 dio
 pm
 harvest
+rmvpe
+fcpe
 ```
 
 If the training set is too noisy,it is recommended to use `crepe` to handle f0
 
-If the f0_predictor parameter is omitted, the default value is `dio`
+If the f0_predictor parameter is omitted, the default value is `rmvpe`
 
 If you want shallow diffusion (optional), you need to add the `--use_diff` parameter, for example:
 
 ```shell
 python preprocess_hubert_f0.py --f0_predictor dio --use_diff
 ```
+
+**Speed Up preprocess**
+
+If your dataset is pretty large,you can increase the param `--num_processes` like that:
+
+```shell
+python preprocess_hubert_f0.py --f0_predictor dio --num_processes 8
+```
+All the worker will be assigned to different GPU if you have more than one GPUs.
 
 After completing the above steps, the dataset directory will contain the preprocessed data, and the dataset_raw folder can be deleted.
 
@@ -336,7 +379,7 @@ Required parameters:
 
 Optional parameters: see the next section
 - `-lg` | `--linear_gradient`: The cross fade length of two audio slices in seconds. If there is a discontinuous voice after forced slicing, you can adjust this value. Otherwise, it is recommended to use the default value of 0.
-- `-f0p` | `--f0_predictor`: Select a F0 predictor, options are `crepe`, `pm`, `dio`, `harvest`, default value is `pm`(note: f0 mean pooling will be enable when using `crepe`)
+- `-f0p` | `--f0_predictor`: Select a F0 predictor, options are `crepe`, `pm`, `dio`, `harvest`, `rmvpe`,`fcpe`, default value is `pm`(note: f0 mean pooling will be enable when using `crepe`)
 - `-a` | `--auto_predict_f0`: automatic pitch prediction, do not enable this when converting singing voices as it can cause serious pitch issues.
 - `-cm` | `--cluster_model_path`: Cluster model or feature retrieval index path, if left blank, it will be automatically set as the default path of these models. If there is no training cluster or feature retrieval, fill in at will.
 - `-cr` | `--cluster_infer_ratio`: The proportion of clustering scheme or feature retrieval ranges from 0 to 1. If there is no training clustering model or feature retrieval, the default is 0.
@@ -398,8 +441,6 @@ The output of the model will be in `logs/44k/feature_and_index.pkl`
   - The `--feature_retrieval` needs to be formulated first, and the clustering mode automatically switches to the feature retrieval mode.
   - Specify `cluster_model_path` in `inference_main.py`. If not specified, the default is `logs/44k/feature_and_index.pkl`.
   - Specify `cluster_infer_ratio` in `inference_main.py`, where `0` means not using feature retrieval at all, `1` means only using feature retrieval, and usually `0.5` is sufficient.
-
-### [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/svc-develop-team/so-vits-svc/blob/4.1-Stable/sovits4_for_colab.ipynb) [sovits4_for_colab.ipynb](https://colab.research.google.com/github/svc-develop-team/so-vits-svc/blob/4.1-Stable/sovits4_for_colab.ipynb)
 
 ## 🗜️ Model compression
 
@@ -474,12 +515,15 @@ Note: For Hubert Onnx models, please use the models provided by MoeSS. Currently
 |[aes35-000039](https://www.aes.org/e-lib/online/browse.cfm?elib=15165) | Dio (F0 Predictor) | Fast and reliable F0 estimation method based on the period extraction of vocal fold vibration of singing voice and speech | [mmorise/World/dio](https://github.com/mmorise/World/blob/master/src/dio.cpp) |
 |[8461329](https://ieeexplore.ieee.org/document/8461329) | Crepe (F0 Predictor) | Crepe: A Convolutional Representation for Pitch Estimation | [maxrmorrison/torchcrepe](https://github.com/maxrmorrison/torchcrepe) |
 |[DOI:10.1016/j.wocn.2018.07.001](https://doi.org/10.1016/j.wocn.2018.07.001) | Parselmouth (F0 Predictor) | Introducing Parselmouth: A Python interface to Praat | [YannickJadoul/Parselmouth](https://github.com/YannickJadoul/Parselmouth) |
+|[2306.15412v2](https://arxiv.org/abs/2306.15412v2) | RMVPE (F0 Predictor) | RMVPE: A Robust Model for Vocal Pitch Estimation in Polyphonic Music | [Dream-High/RMVPE](https://github.com/Dream-High/RMVPE) |
 |[2010.05646](https://arxiv.org/abs/2010.05646) | HIFIGAN (Vocoder) | HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis | [jik876/hifi-gan](https://github.com/jik876/hifi-gan) |
 |[1810.11946](https://arxiv.org/abs/1810.11946.pdf) | NSF (Vocoder) | Neural source-filter-based waveform model for statistical parametric speech synthesis | [openvpi/DiffSinger/modules/nsf_hifigan](https://github.com/openvpi/DiffSinger/tree/refactor/modules/nsf_hifigan)
 |[2006.08195](https://arxiv.org/abs/2006.08195) | Snake (Vocoder) | Neural Networks Fail to Learn Periodic Functions and How to Fix It | [EdwardDixon/snake](https://github.com/EdwardDixon/snake)
 |[2105.02446v3](https://arxiv.org/abs/2105.02446v3) | Shallow Diffusion (PostProcessing)| DiffSinger: Singing Voice Synthesis via Shallow Diffusion Mechanism | [CNChTu/Diffusion-SVC](https://github.com/CNChTu/Diffusion-SVC) |
 |[K-means](https://citeseerx.ist.psu.edu/viewdoc/download;jsessionid=01D65490BADCC216F350D06F84D721AD?doi=10.1.1.308.8619&rep=rep1&type=pdf) | Feature K-means Clustering (PreProcessing)| Some methods for classification and analysis of multivariate observations | This repo |
 | | Feature TopK Retrieval (PreProcessing)| Retrieval based Voice Conversion | [RVC-Project/Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) |
+| | whisper ppg| whisper ppg | [PlayVoice/whisper_ppg](https://github.com/PlayVoice/whisper_ppg) |
+| | bigvgan| bigvgan | [PlayVoice/so-vits-svc-5.0](https://github.com/PlayVoice/so-vits-svc-5.0/tree/bigvgan-mix-v2/vits_decoder/alias) |
 
 
 ## ☀️ Previous contributors

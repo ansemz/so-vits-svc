@@ -6,12 +6,15 @@ import os
 import re
 import subprocess
 import sys
+import traceback
+from multiprocessing import cpu_count
 
 import faiss
 import librosa
 import numpy as np
 import torch
 from scipy.io.wavfile import read
+from sklearn.cluster import MiniBatchKMeans
 from torch.nn import functional as F
 
 MATPLOTLIB_FLAG = False
@@ -40,7 +43,6 @@ def normalize_f0(f0, x_mask, uv, random_scale=True):
     if torch.isnan(f0_norm).any():
         exit(0)
     return f0_norm * x_mask
-
 def plot_data_to_numpy(x, y):
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
@@ -65,14 +67,16 @@ def plot_data_to_numpy(x, y):
 
 
 def f0_to_coarse(f0):
-  is_torch = isinstance(f0, torch.Tensor)
-  f0_mel = 1127 * (1 + f0 / 700).log() if is_torch else 1127 * np.log(1 + f0 / 700)
-  f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * (f0_bin - 2) / (f0_mel_max - f0_mel_min) + 1
-
-  f0_mel[f0_mel <= 1] = 1
-  f0_mel[f0_mel > f0_bin - 1] = f0_bin - 1
-  f0_coarse = (f0_mel + 0.5).int() if is_torch else np.rint(f0_mel).astype(np.int)
-  assert f0_coarse.max() <= 255 and f0_coarse.min() >= 1, (f0_coarse.max(), f0_coarse.min())
+  f0_mel = 1127 * (1 + f0 / 700).log()
+  a = (f0_bin - 2) / (f0_mel_max - f0_mel_min)
+  b = f0_mel_min * a - 1.
+  f0_mel = torch.where(f0_mel > 0, f0_mel * a - b, f0_mel)
+  # torch.clip_(f0_mel, min=1., max=float(f0_bin - 1))
+  f0_coarse = torch.round(f0_mel).long()
+  f0_coarse = f0_coarse * (f0_coarse > 0)
+  f0_coarse = f0_coarse + ((f0_coarse < 1) * 1)
+  f0_coarse = f0_coarse * (f0_coarse < f0_bin)
+  f0_coarse = f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
   return f0_coarse
 
 def get_content(cmodel, y):
@@ -93,7 +97,13 @@ def get_f0_predictor(f0_predictor,hop_length,sampling_rate,**kargs):
         f0_predictor_object = HarvestF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate)
     elif f0_predictor == "dio":
         from modules.F0Predictor.DioF0Predictor import DioF0Predictor
-        f0_predictor_object = DioF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate)
+        f0_predictor_object = DioF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate) 
+    elif f0_predictor == "rmvpe":
+        from modules.F0Predictor.RMVPEF0Predictor import RMVPEF0Predictor
+        f0_predictor_object = RMVPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
+    elif f0_predictor == "fcpe":
+        from modules.F0Predictor.FCPEF0Predictor import FCPEF0Predictor
+        f0_predictor_object = FCPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
     else:
         raise Exception("Unknown f0 predictor")
     return f0_predictor_object
@@ -150,6 +160,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
     if optimizer is not None and not skip_optimizer and checkpoint_dict['optimizer'] is not None:
         optimizer.load_state_dict(checkpoint_dict['optimizer'])
     saved_state_dict = checkpoint_dict['model']
+    model = model.to(list(saved_state_dict.values())[0].dtype)
     if hasattr(model, 'module'):
         state_dict = model.module.state_dict()
     else:
@@ -161,10 +172,11 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
             # print("load", k)
             new_state_dict[k] = saved_state_dict[k]
             assert saved_state_dict[k].shape == v.shape, (saved_state_dict[k].shape, v.shape)
-        except:
-            print("error, %s is not in the checkpoint" % k)
-            logger.info("%s is not in the checkpoint" % k)
-            new_state_dict[k] = v
+        except Exception:
+            if "enc_q" not in k or "emb_g" not in k:
+              print("%s is not in the checkpoint,please check your checkpoint.If you're using pretrain model,just ignore this warning." % k)
+              logger.info("%s is not in the checkpoint" % k)
+              new_state_dict[k] = v
     if hasattr(model, 'module'):
         model.module.load_state_dict(new_state_dict)
     else:
@@ -447,6 +459,7 @@ def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出�
     return data2
 
 def train_index(spk_name,root_dir = "dataset/44k/"):  #from: RVC https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+    n_cpu = cpu_count()
     print("The feature index is constructing.")
     exp_dir = os.path.join(root_dir,spk_name)
     listdir_res = []
@@ -463,6 +476,25 @@ def train_index(spk_name,root_dir = "dataset/44k/"):  #from: RVC https://github.
     big_npy_idx = np.arange(big_npy.shape[0])
     np.random.shuffle(big_npy_idx)
     big_npy = big_npy[big_npy_idx]
+    if big_npy.shape[0] > 2e5:
+        # if(1):
+        info = "Trying doing kmeans %s shape to 10k centers." % big_npy.shape[0]
+        print(info)
+        try:
+            big_npy = (
+                MiniBatchKMeans(
+                    n_clusters=10000,
+                    verbose=True,
+                    batch_size=256 * n_cpu,
+                    compute_labels=False,
+                    init="random",
+                )
+                .fit(big_npy)
+                .cluster_centers_
+            )
+        except Exception:
+            info = traceback.format_exc()
+            print(info)
     n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
     index = faiss.index_factory(big_npy.shape[1] , "IVF%s,Flat" % n_ivf)
     index_ivf = faiss.extract_index_ivf(index)  #

@@ -1,23 +1,24 @@
+import glob
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import time
 import traceback
 from itertools import chain
+from pathlib import Path
 
 # os.system("wget -P cvec/ https://huggingface.co/spaces/innnky/nanami/resolve/main/checkpoint_best_legacy_500.pt")
 import gradio as gr
-import gradio.processing_utils as gr_pu
 import librosa
 import numpy as np
 import soundfile
 import torch
-from scipy.io import wavfile
-from pathlib import Path
 
 from compress_model import removeOptimizer
+from edgetts.tts_voices import SUPPORTED_LANGUAGES
 from inference.infer_tool import Svc
 from utils import mix_model
 
@@ -30,6 +31,8 @@ logging.getLogger('multipart').setLevel(logging.WARNING)
 model = None
 spk = None
 debug = False
+
+local_model_root = './trained'
 
 cuda = {}
 if torch.cuda.is_available():
@@ -76,14 +79,23 @@ def updata_mix_info(files):
             traceback.print_exc()
         raise gr.Error(e)
 
-def modelAnalysis(model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix):
+def modelAnalysis(model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix,local_model_enabled,local_model_selection):
     global model
     try:
         device = cuda[device] if "CUDA" in device else device
         cluster_filepath = os.path.split(cluster_model_path.name) if cluster_model_path is not None else "no_cluster"
+        # get model and config path
+        if (local_model_enabled):
+            # local path
+            model_path = glob.glob(os.path.join(local_model_selection, '*.pth'))[0]
+            config_path = glob.glob(os.path.join(local_model_selection, '*.json'))[0]
+        else:
+            # upload from webpage
+            model_path = model_path.name
+            config_path = config_path.name
         fr = ".pkl" in cluster_filepath[1]
-        model = Svc(model_path.name,
-                config_path.name,
+        model = Svc(model_path,
+                config_path,
                 device=device if device != "Auto" else None,
                 cluster_model_path = cluster_model_path.name if cluster_model_path is not None else "",
                 nsf_hifigan_enhance=enhance,
@@ -126,6 +138,47 @@ def modelUnload():
         model = None
         torch.cuda.empty_cache()
         return sid.update(choices = [],value=""),"模型卸载完毕!"
+    
+def vc_infer(output_format, sid, audio_path, truncated_basename, vc_transform, auto_f0, cluster_ratio, slice_db, noise_scale, pad_seconds, cl_num, lg_num, lgr_num, f0_predictor, enhancer_adaptive_key, cr_threshold, k_step, use_spk_mix, second_encoding, loudness_envelope_adjustment):
+    global model
+    _audio = model.slice_inference(
+        audio_path,
+        sid,
+        vc_transform,
+        slice_db,
+        cluster_ratio,
+        auto_f0,
+        noise_scale,
+        pad_seconds,
+        cl_num,
+        lg_num,
+        lgr_num,
+        f0_predictor,
+        enhancer_adaptive_key,
+        cr_threshold,
+        k_step,
+        use_spk_mix,
+        second_encoding,
+        loudness_envelope_adjustment
+    )  
+    model.clear_empty()
+    #构建保存文件的路径，并保存到results文件夹内
+    str(int(time.time()))
+    if not os.path.exists("results"):
+        os.makedirs("results")
+    key = "auto" if auto_f0 else f"{int(vc_transform)}key"
+    cluster = "_" if cluster_ratio == 0 else f"_{cluster_ratio}_"
+    isdiffusion = "sovits"
+    if model.shallow_diffusion:
+        isdiffusion = "sovdiff"
+
+    if model.only_diffusion:
+        isdiffusion = "diff"
+    
+    output_file_name = 'result_'+truncated_basename+f'_{sid}_{key}{cluster}{isdiffusion}.{output_format}'
+    output_file = os.path.join("results", output_file_name)
+    soundfile.write(output_file, _audio, model.target_sample, format=output_format)
+    return output_file
 
 def vc_fn(sid, input_audio, output_format, vc_transform, auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold,k_step,use_spk_mix,second_encoding,loudness_envelope_adjustment):
     global model
@@ -149,97 +202,44 @@ def vc_fn(sid, input_audio, output_format, vc_transform, auto_f0,cluster_ratio, 
         truncated_basename = Path(input_audio).stem[:-6]
         processed_audio = os.path.join("raw", f"{truncated_basename}.wav")
         soundfile.write(processed_audio, audio, sampling_rate, format="wav")
-        _audio = model.slice_inference(
-            processed_audio,
-            sid,
-            vc_transform,
-            slice_db,
-            cluster_ratio,
-            auto_f0,
-            noise_scale,
-            pad_seconds,
-            cl_num,
-            lg_num,
-            lgr_num,
-            f0_predictor,
-            enhancer_adaptive_key,
-            cr_threshold,
-            k_step,
-            use_spk_mix,
-            second_encoding,
-            loudness_envelope_adjustment
-        )
-        model.clear_empty()
-        #os.remove(temp_path)
-        #构建保存文件的路径，并保存到results文件夹内
-        timestamp = str(int(time.time()))
-        if not os.path.exists("results"):
-            os.makedirs("results")
-        key = "auto" if auto_f0 else f"{int(vc_transform)}key"
-        cluster = "_" if cluster_ratio == 0 else f"_{cluster_ratio}_"
-        isdiffusion = "sovits"
-        if model.shallow_diffusion : isdiffusion = "sovdiff"
-        if model.only_diffusion : isdiffusion = "diff"
-        output_file_name = 'result_'+truncated_basename+f'_{sid}_{key}{cluster}{isdiffusion}.{output_format}'
-        output_file = os.path.join("results", output_file_name)
-        soundfile.write(output_file, _audio, model.target_sample, format=output_format)
+        output_file = vc_infer(output_format, sid, processed_audio, truncated_basename, vc_transform, auto_f0, cluster_ratio, slice_db, noise_scale, pad_seconds, cl_num, lg_num, lgr_num, f0_predictor, enhancer_adaptive_key, cr_threshold, k_step, use_spk_mix, second_encoding, loudness_envelope_adjustment)
+
         return "Success", output_file
     except Exception as e:
         if debug:
             traceback.print_exc()
         raise gr.Error(e)
 
-def tts_func(_text,_rate,_voice):
-    #使用edge-tts把文字转成音频
-    # voice = "zh-CN-XiaoyiNeural"#女性，较高音
-    # voice = "zh-CN-YunxiNeural"#男性
-    voice = "zh-CN-YunxiNeural"#男性
-    if ( _voice == "女" ) :
-        voice = "zh-CN-XiaoyiNeural"
-    output_file = _text[0:10]+".wav"
-    # communicate = edge_tts.Communicate(_text, voice)
-    # await communicate.save(output_file)
-    if _rate>=0:
-        ratestr="+{:.0%}".format(_rate)
-    elif _rate<0:
-        ratestr="{:.0%}".format(_rate)#减号自带
-
-    p=subprocess.Popen("edge-tts "+
-                        " --text "+_text+
-                        " --write-media "+output_file+
-                        " --voice "+voice+
-                        " --rate="+ratestr
-                        ,shell=True,
-                        stdout=subprocess.PIPE,
-                        stdin=subprocess.PIPE)
-    p.wait()
-    return output_file
-
 def text_clear(text):
     return re.sub(r"[\n\,\(\) ]", "", text)
 
-def vc_fn2(sid, input_audio, vc_transform, auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,text2tts,tts_rate,tts_voice,f0_predictor,enhancer_adaptive_key,cr_threshold):
-    #使用edge-tts把文字转成音频
-    text2tts=text_clear(text2tts)
-    output_file=tts_func(text2tts,tts_rate,tts_voice)
-
-    #调整采样率
-    sr2=model.target_sample
-    wav, sr = librosa.load(output_file)
-    wav2 = librosa.resample(wav, orig_sr=sr, target_sr=sr2)
-    save_path2= text2tts[0:10]+"_44k"+".wav"
-    wavfile.write(save_path2,sr2,
-                (wav2 * np.iinfo(np.int16).max).astype(np.int16)
-                )
-
-    #读取音频
-    sample_rate, data=gr_pu.audio_from_file(save_path2)
-    vc_input=(sample_rate, data)
-
-    a,b=vc_fn(sid, vc_input, vc_transform,auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold)
-    os.remove(output_file)
-    os.remove(save_path2)
-    return a,b
+def vc_fn2(_text, _lang, _gender, _rate, _volume, sid, output_format, vc_transform, auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold, k_step,use_spk_mix,second_encoding,loudness_envelope_adjustment):
+    global model
+    try:
+        if model is None:
+            return "You need to upload an model", None
+        if getattr(model, 'cluster_model', None) is None and model.feature_retrieval is False:
+            if cluster_ratio != 0:
+                return "You need to upload an cluster model or feature retrieval model before assigning cluster ratio!", None
+        _rate = f"+{int(_rate*100)}%" if _rate >= 0 else f"{int(_rate*100)}%"
+        _volume = f"+{int(_volume*100)}%" if _volume >= 0 else f"{int(_volume*100)}%"
+        if _lang == "Auto":
+            _gender = "Male" if _gender == "男" else "Female"
+            subprocess.run([sys.executable, "edgetts/tts.py", _text, _lang, _rate, _volume, _gender])
+        else:
+            subprocess.run([sys.executable, "edgetts/tts.py", _text, _lang, _rate, _volume])
+        target_sr = 44100
+        y, sr = librosa.load("tts.wav")
+        resampled_y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+        soundfile.write("tts.wav", resampled_y, target_sr, subtype = "PCM_16")
+        input_audio = "tts.wav"
+        #audio, _ = soundfile.read(input_audio)
+        output_file_path = vc_infer(output_format, sid, input_audio, "tts", vc_transform, auto_f0, cluster_ratio, slice_db, noise_scale, pad_seconds, cl_num, lg_num, lgr_num, f0_predictor, enhancer_adaptive_key, cr_threshold, k_step, use_spk_mix, second_encoding, loudness_envelope_adjustment)
+        os.remove("tts.wav")
+        return "Success", output_file_path
+    except Exception as e:
+        if debug: traceback.print_exc()  # noqa: E701
+        raise gr.Error(e)
 
 def model_compression(_model):
     if _model == "":
@@ -251,6 +251,22 @@ def model_compression(_model):
         output_path = os.path.join(os.getcwd(), output_model_name)
         removeOptimizer(_model.name, output_path)
         return f"模型已成功被保存在了{output_path}"
+
+def scan_local_models():
+    res = []
+    candidates = glob.glob(os.path.join(local_model_root, '**', '*.json'), recursive=True)
+    candidates = set([os.path.dirname(c) for c in candidates])
+    for candidate in candidates:
+        jsons = glob.glob(os.path.join(candidate, '*.json'))
+        pths = glob.glob(os.path.join(candidate, '*.pth'))
+        if (len(jsons) == 1 and len(pths) == 1):
+            # must contain exactly one json and one pth file
+            res.append(candidate)
+    return res
+
+def local_model_refresh_fn():
+    choices = scan_local_models()
+    return gr.Dropdown.update(choices=choices)
 
 def debug_change():
     global debug
@@ -273,9 +289,17 @@ with gr.Blocks(
                     gr.Markdown(value="""
                         <font size=2> 模型设置</font>
                         """)
-                    with gr.Row():
-                        model_path = gr.File(label="选择模型文件")
-                        config_path = gr.File(label="选择配置文件")
+                    with gr.Tabs():
+                        # invisible checkbox that tracks tab status
+                        local_model_enabled = gr.Checkbox(value=False, visible=False)
+                        with gr.TabItem('上传') as local_model_tab_upload:
+                            with gr.Row():
+                                model_path = gr.File(label="选择模型文件")
+                                config_path = gr.File(label="选择配置文件")
+                        with gr.TabItem('本地') as local_model_tab_local:
+                            gr.Markdown(f'模型应当放置于{local_model_root}文件夹下')
+                            local_model_refresh_btn = gr.Button('刷新本地模型列表')
+                            local_model_selection = gr.Dropdown(label='选择模型文件夹', choices=[], interactive=True)
                     with gr.Row():
                         diff_model_path = gr.File(label="选择扩散模型文件")
                         diff_config_path = gr.File(label="选择扩散模型配置文件")
@@ -299,7 +323,7 @@ with gr.Blocks(
                         <font size=2> 推理设置</font>
                         """)
                     auto_f0 = gr.Checkbox(label="自动f0预测，配合聚类模型f0预测效果更好,会导致变调功能失效（仅限转换语音，歌声勾选此项会究极跑调）", value=False)
-                    f0_predictor = gr.Dropdown(label="选择F0预测器,可选择crepe,pm,dio,harvest,默认为pm(注意：crepe为原F0使用均值滤波器)", choices=["pm","dio","harvest","crepe"], value="pm")
+                    f0_predictor = gr.Dropdown(label="选择F0预测器,可选择crepe,pm,dio,harvest,rmvpe,默认为pm(注意：crepe为原F0使用均值滤波器)", choices=["pm","dio","harvest","crepe","rmvpe"], value="pm")
                     vc_transform = gr.Number(label="变调（整数，可以正负，半音数量，升高八度就是12）", value=0)
                     cluster_ratio = gr.Number(label="聚类模型/特征检索混合比例，0-1之间，0即不启用聚类/特征检索。使用聚类/特征检索能提升音色相似度，但会导致咬字下降（如果使用建议0.5左右）", value=0)
                     slice_db = gr.Number(label="切片阈值", value=-40)
@@ -322,8 +346,11 @@ with gr.Blocks(
                     vc_submit = gr.Button("音频转换", variant="primary")
                 with gr.TabItem("文字转音频"):
                     text2tts=gr.Textbox(label="在此输入要转译的文字。注意，使用该功能建议打开F0预测，不然会很怪")
-                    tts_rate = gr.Number(label="tts语速", value=0)
-                    tts_voice = gr.Radio(label="性别",choices=["男","女"], value="男")
+                    with gr.Row():
+                        tts_gender = gr.Radio(label = "说话人性别", choices = ["男","女"], value = "男")
+                        tts_lang = gr.Dropdown(label = "选择语言，Auto为根据输入文字自动识别", choices=SUPPORTED_LANGUAGES, value = "Auto")
+                        tts_rate = gr.Slider(label = "TTS语音变速（倍速相对值）", minimum = -1, maximum = 3, value = 0, step = 0.1)
+                        tts_volume = gr.Slider(label = "TTS语音音量（相对值）", minimum = -1, maximum = 1.5, value = 0, step = 0.1)
                     vc_submit2 = gr.Button("文字转换", variant="primary")
             with gr.Row():
                 with gr.Column():
@@ -384,10 +411,17 @@ with gr.Blocks(
                     <font size=2> WebUI设置</font>
                     """)
                 debug_button = gr.Checkbox(label="Debug模式，如果向社区反馈BUG需要打开，打开后控制台可以显示具体错误提示", value=debug)
+        # refresh local model list
+        local_model_refresh_btn.click(local_model_refresh_fn, outputs=local_model_selection)
+        # set local enabled/disabled on tab switch
+        local_model_tab_upload.select(lambda: False, outputs=local_model_enabled)
+        local_model_tab_local.select(lambda: True, outputs=local_model_enabled)
+        
         vc_submit.click(vc_fn, [sid, vc_input3, output_format, vc_transform,auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold,k_step,use_spk_mix,second_encoding,loudness_envelope_adjustment], [vc_output1, vc_output2])
-        vc_submit2.click(vc_fn2, [sid, vc_input3, vc_transform,auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,text2tts,tts_rate,tts_voice,f0_predictor,enhancer_adaptive_key,cr_threshold], [vc_output1, vc_output2])
+        vc_submit2.click(vc_fn2, [text2tts, tts_lang, tts_gender, tts_rate, tts_volume, sid, output_format, vc_transform,auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold,k_step,use_spk_mix,second_encoding,loudness_envelope_adjustment], [vc_output1, vc_output2])
+
         debug_button.change(debug_change,[],[])
-        model_load_button.click(modelAnalysis,[model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix],[sid,sid_output])
+        model_load_button.click(modelAnalysis,[model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix,local_model_enabled,local_model_selection],[sid,sid_output])
         model_unload_button.click(modelUnload,[],[sid,sid_output])
     os.system("start http://127.0.0.1:7860")
     app.launch()
